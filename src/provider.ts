@@ -514,9 +514,13 @@ async function fetchModelRecommendations(
     controller.abort();
   }, recommendationTimeoutMS);
   try {
-    const baseURL = configuration.url.endsWith('/') ? configuration.url : `${configuration.url}/`;
+    const proxiedURL = applyOpenWebUIProxyPrefix(configuration.url, configuration.useOpenWebUIProxy);
+    const baseURL = proxiedURL.endsWith('/') ? proxiedURL : `${proxiedURL}/`;
     const url = new URL('api/experimental/model-recommendations', baseURL);
     const headers = new Headers(configuration.headers);
+    if (configuration.useOpenWebUIProxy && configuration.openWebUIApiKey) {
+      headers.set('Authorization', `Bearer ${configuration.openWebUIApiKey}`);
+    }
     if (!headers.has('accept')) {
       headers.set('accept', 'application/json');
     }
