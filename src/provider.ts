@@ -45,6 +45,8 @@ interface OllamaProviderConfiguration {
   url: string;
   models: string[];
   headers: Record<string, string>;
+  useOpenWebUIProxy: boolean;
+  openWebUIApiKey: string;
 }
 
 interface OllamaLanguageModel extends vscode.LanguageModelChatInformation {
@@ -52,6 +54,8 @@ interface OllamaLanguageModel extends vscode.LanguageModelChatInformation {
   url: string;
   headers: Record<string, string>;
   local: boolean;
+  useOpenWebUIProxy: boolean;
+  openWebUIApiKey: string;
   thinkingPolicy?: ThinkingPolicy;
   recommendedReplacement?: string;
 }
@@ -143,6 +147,28 @@ class OllamaAPIError extends Error {
   }
 }
 
+// When using Open WebUI proxy mode, prepend /ollama to the base URL so that
+// all Ollama API calls (e.g. /api/tags, /api/chat) resolve as /ollama/api/...
+// which is how Open WebUI's transparent passthrough works.
+function applyOpenWebUIProxyPrefix(url: string, enabled: boolean): string {
+  if (!enabled) return url;
+  const normalized = url.replace(/\/+$/, '');
+  return `${normalized}/ollama`;
+}
+
+// Inject Open WebUI Bearer auth into the headers map when proxy mode is active.
+function applyOpenWebUIAuth(
+  headers: Record<string, string>,
+  enabled: boolean,
+  apiKey: string
+): Record<string, string> {
+  if (!enabled || !apiKey) return headers;
+  const withAuth = { ...headers };
+  withAuth['Authorization'] = `Bearer ${apiKey}`;
+  withAuth['Content-Type'] = 'application/json';
+  return withAuth;
+}
+
 export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProvider<OllamaLanguageModel>, vscode.Disposable {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   private readonly tokenCounts = new CalibratedTokenEstimator();
@@ -176,9 +202,15 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     this.diagnosticsConfigurations.recordResolved(configuration);
     const disposables: vscode.Disposable[] = [];
     const request = createFetch(token, disposables);
+    const proxyUrl = applyOpenWebUIProxyPrefix(configuration.url, configuration.useOpenWebUIProxy);
+    const proxyHeaders = applyOpenWebUIAuth(
+      configuration.headers,
+      configuration.useOpenWebUIProxy,
+      configuration.openWebUIApiKey
+    );
     const ollama = new Ollama({
-      host: configuration.url,
-      headers: configuration.headers,
+      host: proxyUrl,
+      headers: proxyHeaders,
       fetch: request
     });
     const version = await ollama.version()
@@ -195,12 +227,13 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           : availableModels;
 
         const hydratedModels = await hydrateModels(ollama, models);
+        const proxyLabel = configuration.useOpenWebUIProxy ? ' (via Open WebUI proxy)' : '';
         const versionSuffix = version ? ` with Ollama ${version}` : '';
         const recommendationSuffix = recommendations.length > 0
           ? ` using ${recommendations.length} recommendation(s)`
           : '';
         this.output?.appendLine(
-          `Providing ${models.length} Ollama model(s) from ${configuration.url}${versionSuffix}${recommendationSuffix}.`
+          `Providing ${models.length} Ollama model(s) from ${proxyUrl}${proxyLabel}${versionSuffix}${recommendationSuffix}.`
         );
 
         return hydratedModels.map(({ model, show }) => this.toLanguageModel(
@@ -249,14 +282,20 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     );
     const chatFetch = createChatFetch(inferenceTimeout);
     disposables.push(chatFetch);
+    const proxyUrl = applyOpenWebUIProxyPrefix(model.url, model.useOpenWebUIProxy);
+    const proxyHeaders = applyOpenWebUIAuth(
+      model.headers,
+      model.useOpenWebUIProxy,
+      model.openWebUIApiKey
+    );
     const ollama = new Ollama({
-      host: model.url,
-      headers: model.headers,
+      host: proxyUrl,
+      headers: proxyHeaders,
       fetch: createFetch(token, disposables, chatFetch.fetch)
     });
     const tools = toOllamaTools(options.tools);
     this.diagnosticsConfigurations.recordUsed(model);
-    this.output?.appendLine(`Sending chat request to ${model.model} at ${model.url}.`);
+    this.output?.appendLine(`Sending chat request to ${model.model} at ${proxyUrl}.`);
     let requestSucceeded = false;
     let machineContextSource: vscode.CancellationTokenSource | undefined;
     let streamCompleted = false;
@@ -293,8 +332,8 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           machineContextSource.cancel();
         }
         const contextOllama = new Ollama({
-          host: model.url,
-          headers: model.headers,
+          host: proxyUrl,
+          headers: proxyHeaders,
           fetch: createFetch(machineContextSource.token, disposables)
         });
         contextLengthCheck = this.checkMachineContextLength(
@@ -559,6 +598,8 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       url: configuration.url,
       headers: configuration.headers,
       local: !isRemoteModel(model) && !isCloudModel(id),
+      useOpenWebUIProxy: configuration.useOpenWebUIProxy,
+      openWebUIApiKey: configuration.openWebUIApiKey,
       thinkingPolicy: policy,
       recommendedReplacement: replacement
     };
@@ -718,7 +759,14 @@ function getConfiguration(options?: vscode.PrepareLanguageModelChatModelOptions)
     models: Array.isArray(configuration?.models)
       ? configuration.models.filter((model): model is string => typeof model === 'string' && model.length > 0)
       : [],
-    headers: getConfiguredHeaders(configuration, settings)
+    headers: getConfiguredHeaders(configuration, settings),
+    useOpenWebUIProxy:
+      (typeof configuration?.useOpenWebUIProxy === 'boolean' ? configuration.useOpenWebUIProxy :
+        settings.get<boolean>('useOpenWebUIProxy', false)) || false,
+    openWebUIApiKey:
+      typeof configuration?.openWebUIApiKey === 'string'
+        ? configuration.openWebUIApiKey
+        : settings.get<string>('openWebUIApiKey', '') || ''
   };
 }
 
